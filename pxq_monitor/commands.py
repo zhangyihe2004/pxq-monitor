@@ -5,14 +5,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+import time
 
 from .feishu import FeishuGateway, IncomingCommand
-from .monitor import format_count, parse_picked
+from .monitor import format_status, parse_picked
 from .service import MIN_INTERVAL, WatchService, extract_show_id, parse_plan_numbers
 
 log = logging.getLogger("pxq.commands")
 
 MUTATING_COMMANDS = {"监控", "暂停", "恢复", "删除", "票档", "间隔"}
+SEARCH_RESULT_TTL = 900.0
 
 HELP_TEXT = """票星球余票监控指令
 
@@ -25,19 +27,13 @@ HELP_TEXT = """票星球余票监控指令
 帮助"""
 
 
-def _status_text(row) -> str:
-    if row["can_buy_count"] > 0:
-        return f"有票·{format_count(row['can_buy_count'])}"
-    return "可售但无票" if row["sale_started"] else "未开售"
-
-
 def _plans_text(plans: list[dict], picked_ids: set[str]) -> str:
     lines = []
     for index, plan in enumerate(plans, 1):
         mark = "✓" if not picked_ids or plan["pid"] in picked_ids else "✗"
         lines.append(
             f"{mark} {index}. {plan['plan_name']} ¥{plan['price']:g} "
-            f"{_status_text(plan)}"
+            f"{format_status(plan)}"
         )
     return "\n".join(lines) if lines else "当前没有票档"
 
@@ -52,7 +48,7 @@ class CommandWorker:
         self.queue = queue
         self.service = service
         self.feishu = feishu
-        self.last_search: list[dict] = []
+        self._search_results: dict[tuple[str, str], tuple[float, list[dict]]] = {}
 
     async def run_forever(self) -> None:
         log.info("飞书指令 worker 启动")
@@ -61,7 +57,9 @@ class CommandWorker:
             try:
                 response = await self.execute(command)
             except Exception:
-                log.exception("执行飞书指令失败 [%s] %s", command.message_id, command.text)
+                log.exception(
+                    "执行飞书指令失败 [%s] %s", command.message_id, command.text
+                )
                 response = "执行失败，请查看服务日志"
             try:
                 await self.feishu.reply_text(command.message_id, response)
@@ -81,9 +79,9 @@ class CommandWorker:
         if name in MUTATING_COMMANDS and not message.is_admin:
             return "无操作权限"
         if name == "搜索":
-            return await self._search(parts)
+            return await self._search(message, parts)
         if name == "监控":
-            return await self._add(parts)
+            return await self._add(message, parts)
         if name == "列表":
             return self._list()
         if name in ("暂停", "恢复", "删除"):
@@ -94,14 +92,26 @@ class CommandWorker:
             return self._interval(parts)
         return f"未知指令：{parts[0]}\n\n{HELP_TEXT}"
 
-    async def _search(self, parts: list[str]) -> str:
+    @staticmethod
+    def _context_key(message: IncomingCommand) -> tuple[str, str]:
+        return message.chat_id, message.sender_open_id
+
+    async def _search(self, message: IncomingCommand, parts: list[str]) -> str:
         if len(parts) < 2:
             return "用法：搜索 <关键词>"
         keyword = " ".join(parts[1:]).strip()
+        key = self._context_key(message)
+        now = time.monotonic()
+        self._search_results = {
+            context: cached
+            for context, cached in self._search_results.items()
+            if now - cached[0] < SEARCH_RESULT_TTL
+        }
+        self._search_results.pop(key, None)
         shows = await self.service.search(keyword)
-        self.last_search = shows
         if not shows:
             return "未找到相关演出/赛事。"
+        self._search_results[key] = (now, shows)
         lines = []
         for index, show in enumerate(shows, 1):
             sold = "已售罄" if show.get("soldOut") else show.get("showStatus", "")
@@ -113,18 +123,24 @@ class CommandWorker:
             )
         return "\n".join(lines) + "\n\n发送：监控 <序号>"
 
-    def _resolve_target(self, target: str) -> str | None:
+    def _resolve_target(self, message: IncomingCommand, target: str) -> str | None:
         if target.isdigit() and len(target) <= 3:
+            key = self._context_key(message)
+            cached = self._search_results.get(key)
+            if not cached or time.monotonic() - cached[0] >= SEARCH_RESULT_TTL:
+                self._search_results.pop(key, None)
+                return None
             index = int(target)
-            if 1 <= index <= len(self.last_search):
-                return self.last_search[index - 1].get("showId")
+            shows = cached[1]
+            if 1 <= index <= len(shows):
+                return extract_show_id(str(shows[index - 1].get("showId") or ""))
             return None
         return extract_show_id(target)
 
-    async def _add(self, parts: list[str]) -> str:
+    async def _add(self, message: IncomingCommand, parts: list[str]) -> str:
         if len(parts) < 2:
             return "用法：监控 <序号|showId|链接> [场次 N] [票档 3,5] [间隔 秒]"
-        show_id = self._resolve_target(parts[1])
+        show_id = self._resolve_target(message, parts[1])
         if not show_id:
             return "无法解析目标；若使用序号，请先发送“搜索 <关键词>”。"
 
@@ -190,25 +206,30 @@ class CommandWorker:
             plans = self.service.get_plan_states(watch["id"])
             picked = parse_picked(watch["price_filter"])
             watched = [
-                plan for plan in plans.values()
+                plan
+                for plan in plans.values()
                 if not picked or plan["seat_plan_id"] in picked
             ]
-            available = sum(1 for plan in watched if plan["can_buy_count"] > 0)
+            available = sum(
+                1
+                for plan in watched
+                if plan["sale_started"] and plan["can_buy_count"] > 0
+            )
             flag = "▶" if watch["status"] == "active" else "⏸"
             lines = [
                 f"{flag} #{watch['id']} {watch['show_name']}",
                 f"有票票档 {available}/{len(watched)}；间隔 {watch['interval_sec']}s",
             ]
-            sessions = self.service.get_session_states(watch["id"])
             pinned = watch["session_id"] or ""
             if pinned:
-                name = sessions[pinned]["session_name"] if pinned in sessions else "待首次抓取"
+                session = self.service.get_session_state(watch["id"], pinned)
+                name = session["session_name"] if session else "待首次抓取"
                 lines.append(f"场次：{name}")
             for number, plan in enumerate(plans.values(), 1):
                 mark = "✓" if not picked or plan["seat_plan_id"] in picked else "✗"
                 lines.append(
                     f"{mark} {number}. {plan['plan_name']} ¥{plan['price']:g} "
-                    f"{_status_text(plan)}"
+                    f"{format_status(plan)}"
                 )
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks)
@@ -235,18 +256,23 @@ class CommandWorker:
         watch = self.service.get_watch(watch_id)
         if not watch:
             return f"监控 #{watch_id} 不存在。"
-        plans = await self.service.fetch_plans(watch["show_id"], watch["session_id"])
         if parts[2].lower() in ("all", "全部"):
-            picked_ids: set[str] = set()
-        else:
-            try:
-                numbers = parse_plan_numbers(parts[2], len(plans))
-            except ValueError as exc:
-                return str(exc)
-            picked_ids = {plans[number - 1]["pid"] for number in numbers}
-        self.service.set_picked_ids(watch_id, picked_ids)
-        scope = "全部票档" if not picked_ids else f"{len(picked_ids)} 个票档"
-        return f"监控 #{watch_id} 现在监控{scope}：\n{_plans_text(plans, picked_ids)}"
+            if not self.service.set_picked_ids(watch_id, set()):
+                return f"监控 #{watch_id} 不存在。"
+            return f"监控 #{watch_id} 现在监控全部票档。"
+
+        plans = await self.service.fetch_plans(watch["show_id"], watch["session_id"])
+        try:
+            numbers = parse_plan_numbers(parts[2], len(plans))
+        except ValueError as exc:
+            return str(exc)
+        picked_ids = {plans[number - 1]["pid"] for number in numbers}
+        if not self.service.set_picked_ids(watch_id, picked_ids):
+            return f"监控 #{watch_id} 不存在。"
+        return (
+            f"监控 #{watch_id} 现在监控 {len(picked_ids)} 个票档：\n"
+            f"{_plans_text(plans, picked_ids)}"
+        )
 
     def _interval(self, parts: list[str]) -> str:
         if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():

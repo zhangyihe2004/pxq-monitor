@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=pxq-monitor
+Group=pxq-monitor
 WorkingDirectory=/opt/pxq-monitor
 Environment=PXQ_MONITOR_DIR=/opt/pxq-monitor/data
 ExecStart=/opt/pxq-monitor/.venv/bin/python -m pxq_monitor run

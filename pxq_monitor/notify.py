@@ -23,10 +23,12 @@ def build_card(title: str, body_md: str, template: str = "red") -> dict:
             {"tag": "div", "text": {"tag": "lark_md", "content": body_md}},
             {
                 "tag": "note",
-                "elements": [{
-                    "tag": "plain_text",
-                    "content": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }],
+                "elements": [
+                    {
+                        "tag": "plain_text",
+                        "content": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                ],
             },
         ],
     }
