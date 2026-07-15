@@ -177,16 +177,12 @@ class CommandWorker:
 
         plan_option = options["票档"].strip().lower()
         if not plan_option:
-            command = f"监控 {parts[1]} 场次 {selected} 票档 {{choice}} 间隔 {interval}"
-            instructions = []
-            if plans:
-                example = "1" if len(plans) == 1 else "1,2"
-                instructions.append(f"选择票档：{command.format(choice=example)}")
-            instructions.append(f"监控全部：{command.format(choice='全部')}")
             return (
                 f"{show_name}\n"
                 f"场次：{session.get('sessionName', '')}\n\n"
-                f"票档：\n{_plans_text(plans, set())}\n\n" + "\n".join(instructions)
+                f"票档：\n{_plans_text(plans, set())}\n\n"
+                f"发送：监控 {parts[1]} 场次 {selected} "
+                "票档 <编号|全部> [间隔 秒]"
             )
 
         picked_ids: set[str] = set()
