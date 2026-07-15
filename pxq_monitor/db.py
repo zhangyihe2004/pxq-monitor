@@ -79,6 +79,14 @@ class Database:
             "SELECT * FROM watches WHERE id = ?", (watch_id,)
         ).fetchone()
 
+    def find_watch(self, show_id: str, session_id: str) -> sqlite3.Row | None:
+        """查找同一演出场次的现有监控，避免重复添加。"""
+        return self._conn.execute(
+            "SELECT * FROM watches WHERE show_id = ? AND session_id = ?"
+            " ORDER BY id LIMIT 1",
+            (show_id, session_id),
+        ).fetchone()
+
     def set_watch_status(self, watch_id: int, status: str) -> None:
         self._conn.execute("UPDATE watches SET status = ? WHERE id = ?", (status, watch_id))
         self._conn.commit()

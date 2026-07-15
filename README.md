@@ -1,6 +1,6 @@
 # pxq-monitor — 票星球球赛余票监控
 
-轮询票星球公开接口（无需登录），余票状态变化时通过飞书群机器人推送卡片提醒。
+轮询票星球公开接口（无需登录），余票状态变化时通过飞书企业自建应用机器人推送卡片；同时使用飞书长连接接收搜索、监控、暂停等文字指令，无需公网 IP、域名或回调服务。
 
 ## 快速开始
 
@@ -17,26 +17,46 @@ python -m pxq_monitor add 1 --pick 3,5             # 只盯编号 3、5 的票�
 python -m pxq_monitor pick 1 10,11                 # 对已有监控 #1 改选票档
 python -m pxq_monitor pick 1 all                   # 恢复监控全部票档
 
-# 3. 启动监控（正式部署用 systemd，见下文）
+# 3. 启动监控 + 飞书双向指令（正式部署用 systemd，见下文）
 python -m pxq_monitor run
 ```
 
-## 配置飞书推送
+## 配置飞书企业自建应用
 
-1. 飞书建一个群（可以只有自己）→ 群设置 → 群机器人 → 添加**自定义机器人**；
-2. 安全设置勾选**签名校验**，复制 webhook 地址和密钥；
-3. 首次运行任意命令后会生成 `~/.pxq-monitor/config.json`，填入：
+1. 在[飞书开放平台](https://open.feishu.cn/)创建企业自建应用并开启机器人能力；
+2. 开通 `im:message.p2p_msg:readonly`、`im:message.group_at_msg:readonly` 和 `im:message:send_as_bot`；
+3. 事件订阅选择**长连接**，订阅 `im.message.receive_v1`，然后创建并发布版本；
+4. 把应用机器人加入通知群，并把应用可用范围限制为需要使用的人；
+5. 首次运行任意命令后会生成 `~/.pxq-monitor/config.json`，填入：
 
 ```json
 {
-  "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxx",
-  "feishu_secret": "签名密钥"
+  "feishu_app_id": "cli_xxxxxxxxx",
+  "feishu_app_secret": "应用密钥",
+  "feishu_admin_open_ids": ["ou_xxxxxxxxx"],
+  "feishu_default_chat_id": "oc_xxxxxxxxx"
 }
 ```
 
-4. 验证：`python -m pxq_monitor test-notify`，群里收到测试卡片即通。
+首次不知道 `open_id` 和 `chat_id` 时，可以先只填写 App ID/Secret 并启动 `run`，给机器人发一条消息，再从日志中的 `收到飞书消息` 复制两项 ID，补入配置并重启。
 
-未配置 webhook 时提醒降级打印到控制台/日志，监控本身照常运行。
+验证主动推送：`python -m pxq_monitor test-notify`，收到测试卡片即通。App Secret 只放在本地配置文件中，不要提交到 Git。
+
+## 飞书文字指令
+
+单聊直接发送；群聊需要先 @ 机器人。修改类指令只有 `feishu_admin_open_ids` 中的用户可以执行。
+
+| 指令 | 说明 |
+|---|---|
+| `帮助` | 显示指令列表 |
+| `搜索 大连英博` | 搜索赛事；搜索结果只保存在当前进程内存中 |
+| `监控 1 [场次 N] [票档 3,5] [间隔 秒]` | 按最近一次飞书搜索结果添加监控 |
+| `列表` | 查看监控项和票档状态 |
+| `暂停 1` / `恢复 1` / `删除 1` | 管理监控项 |
+| `票档 1 3,5` / `票档 1 全部` | 修改监控票档 |
+| `间隔 1 30` | 修改轮询间隔，最低 15 秒 |
+
+服务重启后飞书搜索结果会清空，重新发送一次 `搜索` 即可。收到的指令先进入单进程内存队列并顺序执行；队列与消息去重记录不会跨重启保留。
 
 ## 数据结构：演出 → 场次 → 票档
 
@@ -79,10 +99,10 @@ python -m pxq_monitor run
 | `list` | 查看所有监控项及每个票档的最新状态 |
 | `pause <id>` / `resume <id>` / `remove <id>` | 暂停 / 恢复 / 删除 |
 | `interval <id> <秒>` | 修改轮询间隔（最低 15s） |
-| `run [--once]` | 启动守护进程；`--once` 抓一轮就退出（配 cron 用，**别和守护进程同时跑**） |
-| `test-notify` | 发送测试卡片验证飞书配置 |
+| `run [--once]` | 默认启动监控、飞书长连接和指令 worker；`--once` 只抓一轮就退出（配 cron 用，**别和守护进程同时跑**） |
+| `test-notify` | 通过应用机器人发送测试卡片 |
 
-增删改监控项**不需要重启守护进程**，它每个调度周期自动重读数据库。
+通过 CLI 或飞书增删改监控项都**不需要重启守护进程**，它每个调度周期自动重读数据库。
 
 ## 目录说明
 
@@ -138,8 +158,8 @@ journalctl -u pxq-monitor -f       # 看实时日志
 
 ## Roadmap
 
-- [x] M1/M2：监控引擎 + 飞书 webhook 推送 + SQLite 多监控项 + systemd
-- [ ] M3：飞书自建应用长连接，双向指令（在飞书里发 `搜索/监控/列表/暂停`）
+- [x] M1/M2：监控引擎 + SQLite 多监控项 + systemd
+- [x] M3：飞书自建应用通知 + 长连接双向文字指令
 - [ ] M4：交互式卡片按钮、每日摘要
 
 > 仅作个人余票提醒用途：只读接口、低频轮询，不涉及自动下单。

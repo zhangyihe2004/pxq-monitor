@@ -7,16 +7,17 @@ import asyncio
 import json
 import logging
 import os
-import re
 import time
 from pathlib import Path
 
 import httpx
 
 from .api import PxqClient, PxqError
+from .commands import CommandWorker
 from .db import Database
+from .feishu import FeishuError, FeishuGateway, IncomingCommand
 from .monitor import MonitorEngine, format_count, parse_picked
-from .notify import Notifier
+from .service import MIN_INTERVAL, WatchService, extract_show_id, parse_plan_numbers
 
 BASE_DIR = Path(os.environ.get("PXQ_MONITOR_DIR", Path.home() / ".pxq-monitor"))
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -24,13 +25,11 @@ DB_PATH = BASE_DIR / "monitor.db"
 SEARCH_CACHE_PATH = BASE_DIR / "last_search.json"
 
 DEFAULT_CONFIG = {
-    "feishu_webhook": "",
-    "feishu_secret": "",
+    "feishu_app_id": "",
+    "feishu_app_secret": "",
+    "feishu_admin_open_ids": [],
+    "feishu_default_chat_id": "",
 }
-
-SHOW_ID_RE = re.compile(r"[0-9a-f]{24}")
-MIN_INTERVAL = 15
-
 
 def load_config() -> dict:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -38,12 +37,8 @@ def load_config() -> dict:
         CONFIG_PATH.write_text(
             json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        print(f"已生成配置文件模板：{CONFIG_PATH}（填入飞书 webhook 后即可推送）")
+        print(f"已生成配置文件模板：{CONFIG_PATH}（填入飞书应用配置后即可推送）")
     return {**DEFAULT_CONFIG, **json.loads(CONFIG_PATH.read_text(encoding="utf-8"))}
-
-
-def build_notifier(config: dict) -> Notifier:
-    return Notifier(config.get("feishu_webhook"), config.get("feishu_secret"))
 
 
 def run_async(coro) -> None:
@@ -52,6 +47,8 @@ def run_async(coro) -> None:
         asyncio.run(coro)
     except (httpx.HTTPError, PxqError) as exc:
         print(f"请求票星球失败（检查网络或 showId）：{exc}")
+    except FeishuError as exc:
+        print(f"飞书应用配置或连接失败：{exc}")
     except KeyboardInterrupt:
         print("\n已停止。")
 
@@ -64,8 +61,7 @@ def resolve_show_id(target: str) -> str | None:
         if 1 <= index <= len(cached):
             return cached[index - 1]["showId"]
         return None
-    match = SHOW_ID_RE.search(target)
-    return match.group(0) if match else None
+    return extract_show_id(target)
 
 
 def format_status(row) -> str:
@@ -74,36 +70,13 @@ def format_status(row) -> str:
     return "可售但无票" if row["sale_started"] else "未开售"
 
 
-async def fetch_plans(client: PxqClient, show_id: str, session_id: str) -> list[dict]:
-    """拉取某场次的票档列表（接口顺序即编号顺序，与守护进程入库顺序一致）。"""
-    pstatic = await client.seat_plans_static(show_id, session_id)
-    meta = {p["seatPlanId"]: p for p in pstatic.get("seatPlans") or []}
-    pdyn = await client.seat_plans_dynamic(show_id, session_id)
-    plans = []
-    for plan in pdyn.get("seatPlans") or []:
-        info = meta.get(plan["seatPlanId"], {})
-        plans.append({
-            "pid": plan["seatPlanId"],
-            "plan_name": info.get("seatPlanName") or plan["seatPlanId"][-6:],
-            "price": float(info.get("originalPrice") or 0),
-            "can_buy_count": int(plan.get("canBuyCount") or 0),
-            "sale_started": bool(plan.get("saleStarted")),
-        })
-    return plans
-
-
 def parse_numbers(raw: str, upper: int) -> list[int] | None:
     """'3,5' -> [3, 5]，越界或格式错误时打印提示并返回 None。"""
     try:
-        numbers = sorted({int(n) for n in raw.replace("，", ",").split(",") if n.strip()})
-    except ValueError:
-        print(f"票档编号需为逗号分隔的数字，如 3,5（收到：{raw}）")
+        return parse_plan_numbers(raw, upper)
+    except ValueError as exc:
+        print(exc)
         return None
-    bad = [n for n in numbers if not 1 <= n <= upper]
-    if bad or not numbers:
-        print(f"票档编号超出范围（1~{upper}）：{bad or raw}")
-        return None
-    return numbers
 
 
 def print_plans(plans: list[dict], picked_ids: set[str]) -> None:
@@ -115,11 +88,14 @@ def print_plans(plans: list[dict], picked_ids: set[str]) -> None:
 # ---- 子命令 ----
 
 async def cmd_search(args) -> None:
+    db = Database(DB_PATH)
     client = PxqClient()
+    service = WatchService(db, client)
     try:
-        shows = await client.search_shows(args.keyword, page=args.page)
+        shows = await service.search(args.keyword, page=args.page)
     finally:
         await client.aclose()
+        db.close()
     if not shows:
         print("未找到相关演出/赛事。")
         return
@@ -146,10 +122,9 @@ async def cmd_add(args) -> None:
     interval = max(args.interval, MIN_INTERVAL)
     db = Database(DB_PATH)
     client = PxqClient()
+    service = WatchService(db, client)
     try:
-        static = await client.sessions_static(show_id)
-        show_name = static.get("showName") or show_id
-        sessions = static.get("sessionVOs") or []
+        show_name, sessions = await service.get_show_sessions(show_id)
         if not sessions:
             print(f"{show_name}：当前没有任何场次（未开票或已失效），未添加。")
             return
@@ -165,7 +140,7 @@ async def cmd_add(args) -> None:
         chosen = sessions[index]
         session_id = chosen["bizShowSessionId"]
 
-        plans = await fetch_plans(client, show_id, session_id)
+        plans = await service.fetch_plans(show_id, session_id)
         picked_ids: set[str] = set()
         if args.pick:
             numbers = parse_numbers(args.pick, len(plans))
@@ -173,8 +148,12 @@ async def cmd_add(args) -> None:
                 return
             picked_ids = {plans[n - 1]["pid"] for n in numbers}
 
-        watch_id = db.add_watch(show_id, show_name, interval,
-                                ",".join(sorted(picked_ids)), session_id)
+        watch_id, created = service.add_watch(
+            show_id, show_name, session_id, interval, picked_ids
+        )
+        if not created:
+            print(f"该场次已在监控中：#{watch_id}，未重复添加。")
+            return
         scope = f"已选 {len(picked_ids)} 个票档" if picked_ids else "全部票档"
         print(f"已添加监控 #{watch_id}：{show_name}")
         print(f"场次：{chosen.get('sessionName', '')}（每 {interval}s，{scope}）")
@@ -189,13 +168,14 @@ async def cmd_add(args) -> None:
 
 async def cmd_list(_args) -> None:
     db = Database(DB_PATH)
+    service = WatchService(db)
     try:
-        watches = db.list_watches()
+        watches = service.list_watches()
         if not watches:
             print("暂无监控项。")
             return
         for w in watches:
-            plans = db.get_plan_states(w["id"])
+            plans = service.get_plan_states(w["id"])
             picked = parse_picked(w["price_filter"])
             watched = [p for p in plans.values()
                        if not picked or p["seat_plan_id"] in picked]
@@ -210,7 +190,7 @@ async def cmd_list(_args) -> None:
             )
             pinned = w["session_id"] or ""
             if pinned:
-                sessions = db.get_session_states(w["id"])
+                sessions = service.get_session_states(w["id"])
                 sname = sessions[pinned]["session_name"] if pinned in sessions else "（待首次抓取）"
                 print(f"    场次: {sname}")
             for i, row in enumerate(plans.values(), 1):
@@ -224,21 +204,22 @@ async def cmd_list(_args) -> None:
 async def cmd_pick(args) -> None:
     db = Database(DB_PATH)
     client = PxqClient()
+    service = WatchService(db, client)
     try:
-        watch = db.get_watch(args.id)
+        watch = service.get_watch(args.id)
         if not watch:
             print(f"监控 #{args.id} 不存在。")
             return
         if args.numbers.strip().lower() in ("all", "全部"):
-            db.set_watch_filter(args.id, "")
+            service.set_picked_ids(args.id, set())
             print(f"监控 #{args.id} 已恢复监控全部票档。")
             return
-        plans = await fetch_plans(client, watch["show_id"], watch["session_id"])
+        plans = await service.fetch_plans(watch["show_id"], watch["session_id"])
         numbers = parse_numbers(args.numbers, len(plans))
         if numbers is None:
             return
         picked_ids = {plans[n - 1]["pid"] for n in numbers}
-        db.set_watch_filter(args.id, ",".join(sorted(picked_ids)))
+        service.set_picked_ids(args.id, picked_ids)
         print(f"监控 #{args.id} 现在只监控 {len(picked_ids)} 个票档：")
         print_plans(plans, picked_ids)
     finally:
@@ -248,15 +229,16 @@ async def cmd_pick(args) -> None:
 
 async def cmd_set_status(args, status: str) -> None:
     db = Database(DB_PATH)
+    service = WatchService(db)
     try:
-        if not db.get_watch(args.id):
+        if not service.get_watch(args.id):
             print(f"监控 #{args.id} 不存在。")
             return
         if status == "removed":
-            db.remove_watch(args.id)
+            service.remove_watch(args.id)
             print(f"已删除监控 #{args.id}。")
         else:
-            db.set_watch_status(args.id, status)
+            service.set_status(args.id, status)
             print(f"监控 #{args.id} 已{'暂停' if status == 'paused' else '恢复'}。")
     finally:
         db.close()
@@ -264,12 +246,12 @@ async def cmd_set_status(args, status: str) -> None:
 
 async def cmd_interval(args) -> None:
     db = Database(DB_PATH)
+    service = WatchService(db)
     try:
-        if not db.get_watch(args.id):
+        if not service.get_watch(args.id):
             print(f"监控 #{args.id} 不存在。")
             return
-        interval = max(args.seconds, MIN_INTERVAL)
-        db.set_watch_interval(args.id, interval)
+        interval = service.set_interval(args.id, args.seconds)
         print(f"监控 #{args.id} 轮询间隔已改为 {interval}s。")
     finally:
         db.close()
@@ -282,22 +264,37 @@ async def cmd_run(args, config: dict) -> None:
     )
     db = Database(DB_PATH)
     client = PxqClient()
-    engine = MonitorEngine(db, client, build_notifier(config))
+    feishu: FeishuGateway | None = None
     try:
+        command_queue: asyncio.Queue[IncomingCommand] = asyncio.Queue(maxsize=100)
+        feishu = FeishuGateway(config, command_queue)
+        service = WatchService(db, client)
+        engine = MonitorEngine(db, client, feishu)
+        worker = CommandWorker(command_queue, service, feishu)
         if args.once:
             await engine.tick()
         else:
-            await engine.run_forever()
+            await asyncio.gather(
+                engine.run_forever(),
+                feishu.run_forever(),
+                worker.run_forever(),
+            )
     finally:
+        if feishu is not None:
+            await feishu.aclose()
         await client.aclose()
         db.close()
 
 
 async def cmd_test_notify(config: dict) -> None:
-    ok = await build_notifier(config).send_card(
-        "✅ 测试消息", "**票星球监控**通知链路正常。", template="green"
-    )
-    print("发送成功" if ok else "发送失败（检查 webhook / secret 配置）")
+    feishu = FeishuGateway(config)
+    try:
+        ok = await feishu.send_card(
+            "✅ 测试消息", "**票星球监控**通知链路正常。", template="green"
+        )
+    finally:
+        await feishu.aclose()
+    print("发送成功" if ok else "发送失败（检查 App ID、App Secret 和 chat_id 配置）")
 
 
 def main() -> None:
@@ -328,7 +325,7 @@ def main() -> None:
     p.add_argument("id", type=int)
     p.add_argument("seconds", type=int)
 
-    p = sub.add_parser("run", help="启动监控守护进程")
+    p = sub.add_parser("run", help="启动监控和飞书双向指令服务")
     p.add_argument("--once", action="store_true", help="所有监控项各抓取一轮后退出")
 
     sub.add_parser("test-notify", help="发送一条测试消息验证飞书配置")

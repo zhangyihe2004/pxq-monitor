@@ -1,1 +1,2 @@
 httpx>=0.27
+lark-oapi>=1.7,<2
