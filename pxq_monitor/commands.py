@@ -19,7 +19,7 @@ SEARCH_RESULT_TTL = 900.0
 HELP_TEXT = """票星球余票监控指令
 
 搜索 <关键词>
-监控 <序号|showId|链接> [场次 N] [票档 3,5] [间隔 秒]
+监控 <序号|showId|链接> [场次 N] [票档 3,5|全部] [间隔 秒]
 列表
 暂停 <id> / 恢复 <id> / 删除 <id>
 票档 <id> <3,5|全部>
@@ -139,7 +139,7 @@ class CommandWorker:
 
     async def _add(self, message: IncomingCommand, parts: list[str]) -> str:
         if len(parts) < 2:
-            return "用法：监控 <序号|showId|链接> [场次 N] [票档 3,5] [间隔 秒]"
+            return "用法：监控 <序号|showId|链接> [场次 N] [票档 3,5|全部] [间隔 秒]"
         show_id = self._resolve_target(message, parts[1])
         if not show_id:
             return "无法解析目标；若使用序号，请先发送“搜索 <关键词>”。"
@@ -149,7 +149,7 @@ class CommandWorker:
         while index < len(parts):
             key = parts[index]
             if key not in options or index + 1 >= len(parts):
-                return "可选参数：场次 N、票档 3,5、间隔 秒"
+                return "可选参数：场次 N、票档 3,5|全部、间隔 秒"
             options[key] = parts[index + 1]
             index += 2
         try:
@@ -175,10 +175,24 @@ class CommandWorker:
         session_id = session["bizShowSessionId"]
         plans = await self.service.fetch_plans(show_id, session_id)
 
+        plan_option = options["票档"].strip().lower()
+        if not plan_option:
+            command = f"监控 {parts[1]} 场次 {selected} 票档 {{choice}} 间隔 {interval}"
+            instructions = []
+            if plans:
+                example = "1" if len(plans) == 1 else "1,2"
+                instructions.append(f"选择票档：{command.format(choice=example)}")
+            instructions.append(f"监控全部：{command.format(choice='全部')}")
+            return (
+                f"{show_name}\n"
+                f"场次：{session.get('sessionName', '')}\n\n"
+                f"票档：\n{_plans_text(plans, set())}\n\n" + "\n".join(instructions)
+            )
+
         picked_ids: set[str] = set()
-        if options["票档"]:
+        if plan_option not in ("all", "全部"):
             try:
-                numbers = parse_plan_numbers(options["票档"], len(plans))
+                numbers = parse_plan_numbers(plan_option, len(plans))
             except ValueError as exc:
                 return str(exc)
             picked_ids = {plans[number - 1]["pid"] for number in numbers}
