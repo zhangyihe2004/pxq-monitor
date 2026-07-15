@@ -394,7 +394,7 @@ class FeishuGateway:
         if chat_type == "p2p" and not is_admin:
             log.warning("单聊用户未授权：open_id=%s chat_id=%s", open_id, chat_id)
             self._processed_messages[message_id] = now
-            await self.reply_text(message_id, "无操作权限")
+            await self.reply_text(message_id, "无操作权限。")
             return
         if chat_type != "p2p" and not (message.get("mentions") or []):
             return
@@ -428,7 +428,7 @@ class FeishuGateway:
         except asyncio.QueueFull:
             log.error("飞书指令队列已满，丢弃消息 %s", message_id)
             self._processed_messages[message_id] = now
-            await self.reply_text(message_id, "当前指令过多，请稍后重试")
+            await self.reply_text(message_id, "当前指令过多，请稍后重试。")
             return
         self._processed_messages[message_id] = now
 
