@@ -1,0 +1,15 @@
+[Unit]
+Description=PXQ (piaoxingqiu) ticket availability monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pxq-monitor
+Environment=PXQ_MONITOR_DIR=/opt/pxq-monitor/data
+ExecStart=/opt/pxq-monitor/.venv/bin/python -m pxq_monitor run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

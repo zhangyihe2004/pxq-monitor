@@ -1,0 +1,25 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local configuration, databases and runtime data
+.env
+.pxq-monitor/
+data/
+*.db
+*.db-shm
+*.db-wal
+last_search.json
+config.json
+
+# Editor and OS files
+.idea/
+.DS_Store
+Thumbs.db
