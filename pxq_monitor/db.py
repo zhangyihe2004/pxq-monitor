@@ -90,7 +90,7 @@ class Database:
         price_filter: str,
         session_id: str,
     ) -> tuple[int, bool]:
-        """原子地添加监控；同一演出场次已存在时返回现有 ID。"""
+        """原子地添加监控；同一场次返回现有 ID，新监控复用最小空闲 ID。"""
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             existing = self._conn.execute(
@@ -102,11 +102,18 @@ class Database:
                 self._conn.commit()
                 return existing["id"], False
 
-            cursor = self._conn.execute(
+            next_id = self._conn.execute(
+                "WITH candidates(candidate_id) AS ("
+                "SELECT 1 UNION SELECT id + 1 FROM watches"
+                ") SELECT MIN(candidate_id) AS next_id FROM candidates "
+                "WHERE candidate_id NOT IN (SELECT id FROM watches)"
+            ).fetchone()["next_id"]
+            self._conn.execute(
                 "INSERT INTO watches "
-                "(show_id, show_name, interval_sec, price_filter, session_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(id, show_id, show_name, interval_sec, price_filter, session_id, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
+                    next_id,
                     show_id,
                     show_name,
                     interval_sec,
@@ -115,10 +122,8 @@ class Database:
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             )
-            if cursor.lastrowid is None:
-                raise sqlite3.DatabaseError("插入监控项后未返回 ID")
             self._conn.commit()
-            return cursor.lastrowid, True
+            return next_id, True
         except BaseException:
             self._conn.rollback()
             raise
